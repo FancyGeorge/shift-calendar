@@ -5,6 +5,8 @@ on:
     - cron: "0 * * * *"   # Runs every hour
   workflow_dispatch:      # Allows manual testing
 
+# This permission replaces the old "PAT_TOKEN". 
+# It lets the default bot write to the repo.
 permissions:
   contents: write
 
@@ -24,24 +26,28 @@ jobs:
       - name: Install dependencies
         run: pip install ics
 
-      # STEP 1: Download using Curl (Bypasses the "400 Error")
+      # STEP 1: Download using the SECRET URL
+      # This pulls the link from your GitHub Secrets so it's hidden from the public
       - name: Download ICS file
+        env:
+          SECRET_URL: ${{ secrets.AHS_CALENDAR_URL }} 
         run: |
+          # The script reads the URL from the environment variable
           curl -v \
             -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
             -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
             -L \
             -o raw_schedule.ics \
-            "https://ahs-wfm.st.inforcloudsuite.com/public/ical/d2b6ca44-805a-480c-9f32-63b87b39eeee/myschedule.ics"
+            "$SECRET_URL"
 
-      # STEP 2: Filter and FORCE NEW FILE
+      # STEP 2: Filter and Save
       - name: Filter ICS with Python
         run: |
           python3 << 'EOF'
           from ics import Calendar, Event
           import os
 
-          # Read the raw file
+          # Verify download worked
           if not os.path.exists("raw_schedule.ics"):
               print("Error: raw_schedule.ics missing.")
               exit(1)
@@ -56,8 +62,6 @@ jobs:
               exit(1)
 
           clean = Calendar()
-          removed_x_count = 0
-          truncated_count = 0
 
           for cal in calendars:
               for e in cal.events:
@@ -68,18 +72,13 @@ jobs:
                       
                       if not start or not end: continue
 
-                      # DEBUG: Print titles to ensure we match "X"
-                      # print(f"Processing: {title}") 
-
                       # REMOVE "X"
-                      if title == "X": 
-                          removed_x_count += 1
-                          continue
+                      if title == "X": continue
 
                       # TRUNCATE OVERNIGHT SHIFTS
+                      # Cuts off shifts at 11:55 PM if they spill into the next day
                       if end.date() > start.date():
                           end = start.replace(hour=23, minute=55)
-                          truncated_count += 1
 
                       new = Event()
                       new.name = title
@@ -91,22 +90,19 @@ jobs:
                   except:
                       continue
 
-          print(f"DEBUG REPORT: Removed {removed_x_count} 'X' shifts.")
-          print(f"DEBUG REPORT: Truncated {truncated_count} overnight shifts.")
-
-          # SAVE AS NEW FILENAME to force GitHub to see it
           with open("clean_shifts.ics", "w") as f:
               f.write(clean.serialize())
+          print("Success: clean_shifts.ics created.")
           EOF
 
       - name: Commit updated ICS
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Add the NEW filename
           git add clean_shifts.ics
-          
-          # Force commit even if logic thinks it's empty (though the new name ensures it isn't)
-          git commit -m "Fresh filtered schedule" || echo "No changes to commit"
-          git push
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Auto-update shifts"
+            git push
+          fi
