@@ -76,4 +76,4 @@ jobs:
           git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}
           git add shifts.ics
           git commit -m "Auto-update shifts" || echo "No changes"
-          git push
+          git push origin HEAD:main
