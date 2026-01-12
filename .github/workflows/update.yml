@@ -1,12 +1,10 @@
-name: Update Shift Calendar
+name: System Config Loader
 
 on:
   schedule:
     - cron: "0 * * * *"   # Runs every hour
   workflow_dispatch:      # Allows manual testing
 
-# This permission replaces the old "PAT_TOKEN". 
-# It lets the default bot write to the repo.
 permissions:
   contents: write
 
@@ -26,39 +24,37 @@ jobs:
       - name: Install dependencies
         run: pip install ics
 
-      # STEP 1: Download using the SECRET URL
-      # This pulls the link from your GitHub Secrets so it's hidden from the public
-      - name: Download ICS file
+      # STEP 1: Download using the SECRET (PAT_TOKEN)
+      - name: Fetch Config Data
         env:
-          SECRET_URL: ${{ secrets.AHS_CALENDAR_URL }} 
+          # We are telling the script that the URL is inside "PAT_TOKEN"
+          SECRET_URL: ${{ secrets.PAT_TOKEN }} 
         run: |
-          # The script reads the URL from the environment variable
-          curl -v \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
-            -L \
-            -o raw_schedule.ics \
-            "$SECRET_URL"
+          # DEBUG CHECK: verify the secret exists
+          if [ -z "$SECRET_URL" ]; then
+            echo "CRITICAL ERROR: The secret 'PAT_TOKEN' is empty!"
+            exit 1
+          fi
 
-      # STEP 2: Filter and Save
-      - name: Filter ICS with Python
+          # Download using the secret link
+          curl -v -L -o raw_data.tmp "$SECRET_URL" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+
+      # STEP 2: Process Data (Anonymize & Filter)
+      - name: Process Config
         run: |
           python3 << 'EOF'
           from ics import Calendar, Event
           import os
 
-          # Verify download worked
-          if not os.path.exists("raw_schedule.ics"):
-              print("Error: raw_schedule.ics missing.")
-              exit(1)
+          if not os.path.exists("raw_data.tmp"): exit(1)
 
-          with open("raw_schedule.ics", "r", encoding="utf-8") as f:
+          with open("raw_data.tmp", "r", encoding="utf-8") as f:
               raw_text = f.read()
 
           try:
               calendars = Calendar.parse_multiple(raw_text)
-          except Exception as e:
-              print(f"Error parsing: {e}")
+          except:
               exit(1)
 
           clean = Calendar()
@@ -71,12 +67,9 @@ jobs:
                       end = e.end
                       
                       if not start or not end: continue
-
-                      # REMOVE "X"
                       if title == "X": continue
 
-                      # TRUNCATE OVERNIGHT SHIFTS
-                      # Cuts off shifts at 11:55 PM if they spill into the next day
+                      # Truncate overnight logic
                       if end.date() > start.date():
                           end = start.replace(hour=23, minute=55)
 
@@ -84,25 +77,28 @@ jobs:
                       new.name = title
                       new.begin = start
                       new.end = end
-                      new.uid = f"{start.strftime('%Y%m%d%H%M')}-{title.replace(' ', '')}-darcy"
+                      # ANONYMIZED UID: "sys-log" instead of "darcy"
+                      new.uid = f"{start.strftime('%Y%m%d%H%M')}-{title.replace(' ', '')}-sys-log"
                       
                       clean.events.add(new)
                   except:
                       continue
 
-          with open("clean_shifts.ics", "w") as f:
+          # BORING FILENAME: Looks like a system log
+          with open("sys_config_8x92.ics", "w") as f:
               f.write(clean.serialize())
-          print("Success: clean_shifts.ics created.")
           EOF
 
-      - name: Commit updated ICS
+      - name: Update Config
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add clean_shifts.ics
-          if git diff --staged --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "Auto-update shifts"
-            git push
-          fi
+          
+          # Add the new boring file
+          git add sys_config_8x92.ics
+          
+          # Try to delete the old obvious file if it still exists
+          git rm --cached clean_shifts.ics || true
+          
+          git commit -m "Update system configuration" || echo "No changes"
+          git push
