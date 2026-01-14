@@ -22,32 +22,37 @@ jobs:
           python-version: "3.x"
 
       - name: Install dependencies
-        run: pip install ics
+        # Added pytz specifically for the time calculation
+        run: pip install ics pytz
 
-      # STEP 1: Download using the SECRET (PAT_TOKEN)
       - name: Fetch Config Data
         env:
-          # We are telling the script that the URL is inside "PAT_TOKEN"
           SECRET_URL: ${{ secrets.PAT_TOKEN }} 
         run: |
-          # DEBUG CHECK: verify the secret exists
-          if [ -z "$SECRET_URL" ]; then
-            echo "CRITICAL ERROR: The secret 'PAT_TOKEN' is empty!"
-            exit 1
+          # SECURITY & DOWNLOAD
+          SECRET_LEN=${#SECRET_URL}
+          if [ "$SECRET_LEN" -lt 10 ]; then
+             echo "CRITICAL ERROR: Secret is empty or too short."
+             exit 1
           fi
-
-          # Download using the secret link
-          curl -v -L -o raw_data.tmp "$SECRET_URL" \
+          
+          CLEAN_URL=$(echo "$SECRET_URL" | tr -d ' "')
+          curl -v -L -o raw_data.tmp "$CLEAN_URL" \
             -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 
-      # STEP 2: Process Data (Anonymize & Filter)
       - name: Process Config
         run: |
           python3 << 'EOF'
           from ics import Calendar, Event
+          from datetime import datetime, timedelta
           import os
+          import sys
+          import pytz
 
-          if not os.path.exists("raw_data.tmp"): exit(1)
+          # === SAFETY CHECK: MISSING FILE ===
+          if not os.path.exists("raw_data.tmp"): 
+              print("::error::Download failed, file missing. Aborting.")
+              sys.exit(1)
 
           with open("raw_data.tmp", "r", encoding="utf-8") as f:
               raw_text = f.read()
@@ -55,9 +60,14 @@ jobs:
           try:
               calendars = Calendar.parse_multiple(raw_text)
           except:
-              exit(1)
+              print("::error::File corrupted. Aborting.")
+              sys.exit(1)
 
           clean = Calendar()
+          event_count = 0
+          
+          # Define Local Timezone (Alberta)
+          ab_tz = pytz.timezone('America/Edmonton')
 
           for cal in calendars:
               for e in cal.events:
@@ -69,7 +79,28 @@ jobs:
                       if not start or not end: continue
                       if title == "X": continue
 
-                      # Truncate overnight logic
+                      # === RENAMING LOGIC ===
+                      # 1. Calculate original duration in hours
+                      duration_hours = (end - start).total_seconds() / 3600
+                      
+                      # 2. Get the start hour in Alberta Time (0-23)
+                      local_start = start.astimezone(ab_tz)
+                      h = local_start.hour
+
+                      # 3. Apply Rules (approximate 11-13 hours to catch 12h shifts)
+                      if 11 <= duration_hours <= 13:
+                          # DAY: Starts roughly 7am (6am-8am buffer)
+                          if 6 <= h <= 8:
+                              title = "D12"
+                          # EVENING: Starts roughly 10am (9am-11am buffer)
+                          elif 9 <= h <= 11:
+                              title = "E12"
+                          # NIGHT: Starts roughly 7pm (6pm-8pm buffer)
+                          elif 18 <= h <= 20:
+                              title = "N12"
+
+                      # === TRUNCATE LOGIC (Existing) ===
+                      # If it spills overnight (like N12), cut it at 11:55 PM
                       if end.date() > start.date():
                           end = start.replace(hour=23, minute=55)
 
@@ -77,28 +108,39 @@ jobs:
                       new.name = title
                       new.begin = start
                       new.end = end
-                      # ANONYMIZED UID: "sys-log" instead of "darcy"
                       new.uid = f"{start.strftime('%Y%m%d%H%M')}-{title.replace(' ', '')}-sys-log"
                       
                       clean.events.add(new)
+                      event_count += 1
                   except:
                       continue
 
-          # BORING FILENAME: Looks like a system log
+          # === SAFETY CHECK: DEADMAN SWITCH ===
+          if event_count < 5:
+             print(f"::error::SAFETY TRIGGER: Only found {event_count} events. Aborting.")
+             sys.exit(1)
+
+          # === HEARTBEAT ===
+          now = datetime.now() 
+          heartbeat = Event()
+          heartbeat.name = f"✅ Updated: {now.strftime('%H:%M')} UTC"
+          heartbeat.begin = now
+          heartbeat.duration = timedelta(minutes=30)
+          heartbeat.uid = f"heartbeat-{now.strftime('%Y%m%d%H%M')}"
+          clean.events.add(heartbeat)
+
           with open("sys_config_8x92.ics", "w") as f:
               f.write(clean.serialize())
+              
+          print(f"SUCCESS: Saved {event_count} events (Renamed & Filtered).")
           EOF
 
       - name: Update Config
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Add the new boring file
           git add sys_config_8x92.ics
-          
-          # Try to delete the old obvious file if it still exists
           git rm --cached clean_shifts.ics || true
-          
           git commit -m "Update system configuration" || echo "No changes"
           git push
+          
